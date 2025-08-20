@@ -145,18 +145,37 @@ class WalletManager {
             const hub = 'https://hub.snapshot.org';
             const client = new snapshot.Client712(hub);
 
-            const receipt = await client.vote(this.wallet, this.wallet.address, {
+            // Format the vote payload according to Snapshot.js expectations
+            const votePayload = {
                 space: spaceId,
                 proposal: proposalId,
                 type: 'single-choice',
                 choice: choice,
-                reason: reason,
                 app: 'snapshot-mcp'
-            });
+            };
+
+            // Add reason only if provided and not using shutter privacy
+            if (reason && reason.trim()) {
+                votePayload.reason = reason.trim();
+            }
+
+            console.log('Vote payload:', JSON.stringify(votePayload, null, 2));
+            console.log('Wallet address:', this.wallet.address);
+
+            // Use the wallet as the web3 provider for signing
+            const receipt = await client.vote(this.wallet, this.wallet.address, votePayload);
 
             return receipt;
         } catch (error) {
-            throw new Error(`Failed to cast vote: ${error.message}`);
+            console.error('Vote casting error:', error);
+            // Provide more detailed error information
+            if (error.message) {
+                throw new Error(`Failed to cast vote: ${error.message}`);
+            } else if (error.reason) {
+                throw new Error(`Failed to cast vote: ${error.reason}`);
+            } else {
+                throw new Error(`Failed to cast vote: ${JSON.stringify(error)}`);
+            }
         }
     }
 
