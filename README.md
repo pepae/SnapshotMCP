@@ -82,7 +82,7 @@ For development or self-hosting:
 
 1. **Clone the repository**:
 ```bash
-git clone https://github.com/your-username/SnapshotMCP.git
+git clone https://github.com/pepae/SnapshotMCP.git
 cd SnapshotMCP
 ```
 
