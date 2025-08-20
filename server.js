@@ -1282,7 +1282,10 @@ class MCPHandler {
                 return {
                     protocolVersion: "2024-11-05",
                     capabilities: {
-                        tools: {}
+                        tools: {},
+                        resources: {},
+                        prompts: {},
+                        logging: {}
                     },
                     serverInfo: {
                         name: "Snapshot MCP Server",
@@ -1344,13 +1347,59 @@ class MCPHandler {
 const mcpHandler = new MCPHandler();
 
 /**
- * HTTP Server with MCP Protocol Support
+ * Session Manager for Claude Web compatibility
+ */
+class SessionManager {
+    constructor() {
+        this.sessions = new Map();
+    }
+
+    createSession() {
+        const sessionId = randomBytes(16).toString('hex');
+        this.sessions.set(sessionId, {
+            id: sessionId,
+            created: Date.now(),
+            lastAccess: Date.now()
+        });
+        return sessionId;
+    }
+
+    validateSession(sessionId) {
+        if (!sessionId) return false;
+        const session = this.sessions.get(sessionId);
+        if (!session) return false;
+        
+        // Update last access
+        session.lastAccess = Date.now();
+        return true;
+    }
+
+    cleanupSessions() {
+        const now = Date.now();
+        const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+        
+        for (const [sessionId, session] of this.sessions.entries()) {
+            if (now - session.lastAccess > maxAge) {
+                this.sessions.delete(sessionId);
+            }
+        }
+    }
+}
+
+const sessionManager = new SessionManager();
+
+// Clean up sessions every hour
+setInterval(() => sessionManager.cleanupSessions(), 60 * 60 * 1000);
+
+/**
+ * HTTP Server with MCP Protocol Support and Claude Web Compatibility
  */
 const server = createServer(async (req, res) => {
-    // Set CORS headers for web compatibility
+    // Set comprehensive CORS headers for Claude Web compatibility
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID');
+    res.setHeader('Access-Control-Max-Age', '86400');
     
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -1369,59 +1418,161 @@ const server = createServer(async (req, res) => {
             server: "Snapshot MCP Server",
             version: SERVER_VERSION,
             snapshot_hub: SNAPSHOT_HUB_URL,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            transport: "streamable-http",
+            mcp_protocol_version: "2024-11-05"
         }));
         return;
     }
 
-    // MCP endpoint (handle both /mcp and /mcp/)
-    if ((url.pathname === '/mcp' || url.pathname === '/mcp/') && req.method === 'POST') {
-        try {
-            let body = '';
-            req.on('data', chunk => {
-                body += chunk.toString();
-            });
-
-            req.on('end', async () => {
-                let request;
-                try {
-                    request = JSON.parse(body);
-                    const response = await mcpHandler.handleRequest(request.method, request.params);
-                    
-                    // Handle notifications (no response needed)
-                    if (response === null) {
-                        res.writeHead(200);
-                        res.end();
-                        return;
-                    }
-                    
-                    res.setHeader('Content-Type', 'application/json');
-                    res.writeHead(200);
-                    res.end(JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: request.id,
-                        result: response
-                    }));
-                } catch (error) {
-                    console.error('MCP request error:', error);
-                    res.setHeader('Content-Type', 'application/json');
-                    res.writeHead(200);
-                    res.end(JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: request?.id || null,
-                        error: {
-                            code: -32603,
-                            message: error.message
-                        }
-                    }));
-                }
-            });
-        } catch (error) {
-            console.error('Request processing error:', error);
-            res.writeHead(500);
-            res.end('Internal Server Error');
+    // MCP endpoint - supporting both GET (SSE) and POST (JSON-RPC)
+    if ((url.pathname === '/mcp' || url.pathname === '/mcp/')) {
+        // Handle protocol version
+        const protocolVersion = req.headers['mcp-protocol-version'] || req.headers['Mcp-Protocol-Version'];
+        if (protocolVersion && protocolVersion !== '2024-11-05') {
+            res.writeHead(400);
+            res.end('Unsupported MCP protocol version');
+            return;
         }
-        return;
+
+        // Handle session management
+        const sessionId = req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'];
+        
+        if (req.method === 'POST') {
+            // Handle JSON-RPC requests via POST
+            try {
+                let body = '';
+                req.on('data', chunk => {
+                    body += chunk.toString();
+                });
+
+                req.on('end', async () => {
+                    let request;
+                    try {
+                        request = JSON.parse(body);
+                        
+                        // Check if session is required and valid (except for initialization)
+                        if (request.method !== 'initialize' && sessionId && !sessionManager.validateSession(sessionId)) {
+                            res.writeHead(404);
+                            res.end('Session not found');
+                            return;
+                        }
+
+                        const response = await mcpHandler.handleRequest(request.method, request.params);
+                        
+                        // Handle notifications (no response needed)
+                        if (response === null) {
+                            res.writeHead(202); // Accepted
+                            res.end();
+                            return;
+                        }
+
+                        // Create session for initialization
+                        let responseHeaders = { 'Content-Type': 'application/json' };
+                        if (request.method === 'initialize') {
+                            const newSessionId = sessionManager.createSession();
+                            responseHeaders['Mcp-Session-Id'] = newSessionId;
+                        }
+
+                        // Check if client accepts SSE for streaming responses
+                        const acceptHeader = req.headers.accept || '';
+                        const supportsSSE = acceptHeader.includes('text/event-stream');
+                        const supportsJSON = acceptHeader.includes('application/json');
+
+                        if (supportsSSE && (request.method === 'tools/call' || request.method.includes('/'))) {
+                            // Use SSE for complex operations
+                            responseHeaders['Content-Type'] = 'text/event-stream';
+                            responseHeaders['Cache-Control'] = 'no-cache';
+                            responseHeaders['Connection'] = 'keep-alive';
+                            
+                            // Set response headers
+                            for (const [key, value] of Object.entries(responseHeaders)) {
+                                res.setHeader(key, value);
+                            }
+                            res.writeHead(200);
+
+                            // Send the response as SSE
+                            const sseData = JSON.stringify({
+                                jsonrpc: "2.0",
+                                id: request.id,
+                                result: response
+                            });
+                            res.write(`data: ${sseData}\n\n`);
+                            res.end();
+                        } else {
+                            // Use regular JSON response
+                            for (const [key, value] of Object.entries(responseHeaders)) {
+                                res.setHeader(key, value);
+                            }
+                            res.writeHead(200);
+                            res.end(JSON.stringify({
+                                jsonrpc: "2.0",
+                                id: request.id,
+                                result: response
+                            }));
+                        }
+                    } catch (error) {
+                        console.error('MCP request error:', error);
+                        res.setHeader('Content-Type', 'application/json');
+                        res.writeHead(200);
+                        res.end(JSON.stringify({
+                            jsonrpc: "2.0",
+                            id: request?.id || null,
+                            error: {
+                                code: -32603,
+                                message: error.message
+                            }
+                        }));
+                    }
+                });
+            } catch (error) {
+                console.error('Request processing error:', error);
+                res.writeHead(500);
+                res.end('Internal Server Error');
+            }
+            return;
+        }
+
+        if (req.method === 'GET') {
+            // Handle SSE connection for server-to-client messaging
+            const acceptHeader = req.headers.accept || '';
+            if (acceptHeader.includes('text/event-stream')) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                res.writeHead(200);
+
+                // Send keep-alive every 30 seconds
+                const keepAlive = setInterval(() => {
+                    res.write(': keep-alive\n\n');
+                }, 30000);
+
+                // Clean up on connection close
+                req.on('close', () => {
+                    clearInterval(keepAlive);
+                });
+
+                // Keep connection open for server-initiated messages
+                return;
+            } else {
+                res.writeHead(405);
+                res.end('Method Not Allowed - GET requires text/event-stream accept header');
+                return;
+            }
+        }
+
+        if (req.method === 'DELETE') {
+            // Handle session termination
+            if (sessionId && sessionManager.validateSession(sessionId)) {
+                sessionManager.sessions.delete(sessionId);
+                res.writeHead(200);
+                res.end();
+            } else {
+                res.writeHead(404);
+                res.end('Session not found');
+            }
+            return;
+        }
     }
 
     // Default response for unknown routes
