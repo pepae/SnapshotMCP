@@ -2,8 +2,7 @@
 
 The Snapshot MCP Server bridges the gap between AI assistants and decentralized governance platforms. It provides real-time access to governance data from thousands of DAOs and communities using the Snapshot platform, enabling intelligent analysis and interaction with Web3 governance systems.
 
-![Untitledvideo10-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/53d42758-609f-46e1-99ac-4b3d56725118)
-
+![Untitledvideo10-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/bb0559f6-a983-48a6-b593-0e196be509fd)
 
 > **⚠️ ALPHA SOFTWARE DISCLAIMER**
 > 
