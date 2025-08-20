@@ -20,6 +20,9 @@
 import { createServer } from 'http';
 import { URL } from 'url';
 import fetch from 'node-fetch';
+import snapshot from '@snapshot-labs/snapshot.js';
+import { ethers } from 'ethers';
+import { randomBytes } from 'crypto';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -30,6 +33,179 @@ const SERVER_VERSION = "1.0.0";
 const SERVER_PORT = parseInt(process.env.PORT || "3001");
 const SNAPSHOT_HUB_URL = process.env.SNAPSHOT_HUB_URL || "https://hub.snapshot.org";
 const SNAPSHOT_GRAPHQL_ENDPOINT = `${SNAPSHOT_HUB_URL}/graphql`;
+
+/**
+ * Wallet Manager for Snapshot operations
+ * Handles wallet creation, importing, and signing operations
+ */
+class WalletManager {
+    constructor() {
+        this.wallet = null;
+        // Use a simple provider for signing (no network needed for Snapshot)
+        this.provider = new ethers.providers.JsonRpcProvider('https://rpc.ankr.com/eth');
+    }
+
+    /**
+     * Create a new random wallet
+     */
+    createWallet() {
+        try {
+            this.wallet = ethers.Wallet.createRandom();
+            // Connect to provider for signing
+            this.wallet = this.wallet.connect(this.provider);
+            return {
+                address: this.wallet.address,
+                mnemonic: this.wallet.mnemonic?.phrase,
+                privateKey: this.wallet.privateKey
+            };
+        } catch (error) {
+            throw new Error(`Failed to create wallet: ${error.message}`);
+        }
+    }
+
+    /**
+     * Import wallet from private key
+     */
+    importWallet(privateKey) {
+        try {
+            this.wallet = new ethers.Wallet(privateKey);
+            // Connect to provider for signing
+            this.wallet = this.wallet.connect(this.provider);
+            return {
+                address: this.wallet.address,
+                privateKey: this.wallet.privateKey
+            };
+        } catch (error) {
+            throw new Error(`Failed to import wallet: ${error.message}`);
+        }
+    }
+
+    /**
+     * Get current wallet address
+     */
+    getAddress() {
+        if (!this.wallet) {
+            throw new Error('No wallet configured. Create or import a wallet first.');
+        }
+        return this.wallet.address;
+    }
+
+    /**
+     * Create a proposal using Snapshot.js SDK
+     */
+    async createProposal(spaceId, proposalData) {
+        if (!this.wallet) {
+            throw new Error('No wallet configured. Create or import a wallet first.');
+        }
+
+        try {
+            const hub = 'https://hub.snapshot.org';
+            const client = new snapshot.Client712(hub);
+
+            // Get current block number if snapshot is 'latest'
+            let snapshotBlock = proposalData.snapshot;
+            if (!snapshotBlock || snapshotBlock === 'latest') {
+                try {
+                    const blockNumber = await this.provider.getBlockNumber();
+                    snapshotBlock = blockNumber;
+                } catch (blockError) {
+                    // Fallback to a recent block number
+                    snapshotBlock = 18000000; // A reasonably recent block number
+                }
+            }
+
+            const receipt = await client.proposal(this.wallet, this.wallet.address, {
+                space: spaceId,
+                type: proposalData.type || 'single-choice',
+                title: proposalData.title,
+                body: proposalData.body,
+                choices: proposalData.choices,
+                start: proposalData.start || Math.floor(Date.now() / 1000),
+                end: proposalData.end || Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60), // 7 days default
+                snapshot: snapshotBlock,
+                plugins: proposalData.plugins || JSON.stringify({}),
+                app: 'snapshot-mcp'
+            });
+
+            return receipt;
+        } catch (error) {
+            throw new Error(`Failed to create proposal: ${error.message}`);
+        }
+    }
+
+    /**
+     * Cast a vote on a proposal
+     */
+    async castVote(spaceId, proposalId, choice, reason = '') {
+        if (!this.wallet) {
+            throw new Error('No wallet configured. Create or import a wallet first.');
+        }
+
+        try {
+            const hub = 'https://hub.snapshot.org';
+            const client = new snapshot.Client712(hub);
+
+            const receipt = await client.vote(this.wallet, this.wallet.address, {
+                space: spaceId,
+                proposal: proposalId,
+                type: 'single-choice',
+                choice: choice,
+                reason: reason,
+                app: 'snapshot-mcp'
+            });
+
+            return receipt;
+        } catch (error) {
+            throw new Error(`Failed to cast vote: ${error.message}`);
+        }
+    }
+
+    /**
+     * Follow a space
+     */
+    async followSpace(spaceId) {
+        if (!this.wallet) {
+            throw new Error('No wallet configured. Create or import a wallet first.');
+        }
+
+        try {
+            const hub = 'https://hub.snapshot.org';
+            const client = new snapshot.Client712(hub);
+
+            const receipt = await client.follow(this.wallet, this.wallet.address, {
+                space: spaceId,
+                app: 'snapshot-mcp'
+            });
+
+            return receipt;
+        } catch (error) {
+            throw new Error(`Failed to follow space: ${error.message}`);
+        }
+    }
+
+    /**
+     * Unfollow a space
+     */
+    async unfollowSpace(spaceId) {
+        if (!this.wallet) {
+            throw new Error('No wallet configured. Create or import a wallet first.');
+        }
+
+        try {
+            const hub = 'https://hub.snapshot.org';
+            const client = new snapshot.Client712(hub);
+
+            const receipt = await client.unfollow(this.wallet, this.wallet.address, {
+                space: spaceId,
+                app: 'snapshot-mcp'
+            });
+
+            return receipt;
+        } catch (error) {
+            throw new Error(`Failed to unfollow space: ${error.message}`);
+        }
+    }
+}
 
 /**
  * Snapshot GraphQL API Client
@@ -392,9 +568,6 @@ class SnapshotAPI {
     }
 }
 
-// Initialize Snapshot API client
-const snapshotAPI = new SnapshotAPI();
-
 /**
  * MCP Tool implementations for Snapshot functionality
  */
@@ -415,7 +588,7 @@ const tools = {
             },
             required: ["space_id"]
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const result = await snapshotAPI.getSpace(args.space_id);
                 return {
@@ -474,7 +647,7 @@ const tools = {
                 }
             }
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const where = {};
                 
@@ -525,7 +698,7 @@ const tools = {
             },
             required: ["proposal_id"]
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const result = await snapshotAPI.getProposal(args.proposal_id);
                 return {
@@ -589,7 +762,7 @@ const tools = {
                 }
             }
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const where = {};
                 
@@ -666,7 +839,7 @@ const tools = {
             },
             required: ["proposal_id"]
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const result = await snapshotAPI.getVotes(args.proposal_id, {
                     first: Math.min(args.first || 100, 1000),
@@ -708,7 +881,7 @@ const tools = {
             },
             required: ["address"]
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const result = await snapshotAPI.getUserProfile(args.address);
                 return {
@@ -752,7 +925,7 @@ const tools = {
             },
             required: ["address"]
         },
-        handler: async (args) => {
+        handler: async (args, snapshotAPI, walletManager) => {
             try {
                 const result = await snapshotAPI.getUserFollows(args.address, {
                     first: Math.min(args.first || 20, 100),
@@ -774,6 +947,303 @@ const tools = {
                 };
             }
         }
+    },
+
+    /**
+     * Create a new wallet
+     */
+    create_wallet: {
+        name: "create_wallet",
+        description: "Create a new random wallet for Snapshot operations",
+        inputSchema: {
+            type: "object",
+            properties: {},
+            required: []
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const wallet = walletManager.createWallet();
+                return {
+                    status: "success",
+                    data: {
+                        address: wallet.address,
+                        mnemonic: wallet.mnemonic,
+                        message: "Wallet created successfully. Save your mnemonic phrase securely!"
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Import wallet from private key
+     */
+    import_wallet: {
+        name: "import_wallet",
+        description: "Import a wallet using a private key",
+        inputSchema: {
+            type: "object",
+            properties: {
+                private_key: {
+                    type: "string",
+                    description: "The private key to import (with or without 0x prefix)"
+                }
+            },
+            required: ["private_key"]
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const wallet = walletManager.importWallet(args.private_key);
+                return {
+                    status: "success",
+                    data: {
+                        address: wallet.address,
+                        message: "Wallet imported successfully!"
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Get current wallet address
+     */
+    get_wallet_address: {
+        name: "get_wallet_address",
+        description: "Get the address of the currently configured wallet",
+        inputSchema: {
+            type: "object",
+            properties: {},
+            required: []
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const address = walletManager.getAddress();
+                return {
+                    status: "success",
+                    data: {
+                        address: address,
+                        message: "Current wallet address retrieved"
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Create a proposal
+     */
+    create_proposal: {
+        name: "create_proposal",
+        description: "Create a new proposal in a Snapshot space",
+        inputSchema: {
+            type: "object",
+            properties: {
+                space_id: {
+                    type: "string",
+                    description: "The space ID where to create the proposal"
+                },
+                title: {
+                    type: "string",
+                    description: "The proposal title"
+                },
+                body: {
+                    type: "string",
+                    description: "The proposal description/body"
+                },
+                choices: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Array of voting choices"
+                },
+                type: {
+                    type: "string",
+                    enum: ["single-choice", "approval", "quadratic", "ranked-choice", "weighted", "basic"],
+                    description: "Voting type",
+                    default: "single-choice"
+                },
+                start: {
+                    type: "number",
+                    description: "Start timestamp (Unix epoch). Defaults to now"
+                },
+                end: {
+                    type: "number",
+                    description: "End timestamp (Unix epoch). Defaults to 7 days from now"
+                },
+                snapshot: {
+                    type: "string",
+                    description: "Block number for snapshot. Defaults to 'latest'"
+                }
+            },
+            required: ["space_id", "title", "body", "choices"]
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const receipt = await walletManager.createProposal(args.space_id, {
+                    title: args.title,
+                    body: args.body,
+                    choices: args.choices,
+                    type: args.type,
+                    start: args.start,
+                    end: args.end,
+                    snapshot: args.snapshot
+                });
+                
+                return {
+                    status: "success",
+                    data: {
+                        receipt: receipt,
+                        message: "Proposal created successfully!"
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Cast a vote on a proposal
+     */
+    cast_vote: {
+        name: "cast_vote",
+        description: "Cast a vote on a Snapshot proposal",
+        inputSchema: {
+            type: "object",
+            properties: {
+                space_id: {
+                    type: "string",
+                    description: "The space ID containing the proposal"
+                },
+                proposal_id: {
+                    type: "string",
+                    description: "The proposal ID to vote on"
+                },
+                choice: {
+                    type: "number",
+                    description: "The choice number (1-based index for single-choice voting)"
+                },
+                reason: {
+                    type: "string",
+                    description: "Optional reason for the vote",
+                    default: ""
+                }
+            },
+            required: ["space_id", "proposal_id", "choice"]
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const receipt = await walletManager.castVote(
+                    args.space_id,
+                    args.proposal_id,
+                    args.choice,
+                    args.reason || ""
+                );
+                
+                return {
+                    status: "success",
+                    data: {
+                        receipt: receipt,
+                        message: "Vote cast successfully!"
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Follow a space
+     */
+    follow_space: {
+        name: "follow_space",
+        description: "Follow a Snapshot space",
+        inputSchema: {
+            type: "object",
+            properties: {
+                space_id: {
+                    type: "string",
+                    description: "The space ID to follow"
+                }
+            },
+            required: ["space_id"]
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const receipt = await walletManager.followSpace(args.space_id);
+                
+                return {
+                    status: "success",
+                    data: {
+                        receipt: receipt,
+                        message: `Successfully followed space: ${args.space_id}`
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
+    },
+
+    /**
+     * Unfollow a space
+     */
+    unfollow_space: {
+        name: "unfollow_space",
+        description: "Unfollow a Snapshot space",
+        inputSchema: {
+            type: "object",
+            properties: {
+                space_id: {
+                    type: "string",
+                    description: "The space ID to unfollow"
+                }
+            },
+            required: ["space_id"]
+        },
+        handler: async (args, snapshotAPI, walletManager) => {
+            try {
+                const receipt = await walletManager.unfollowSpace(args.space_id);
+                
+                return {
+                    status: "success",
+                    data: {
+                        receipt: receipt,
+                        message: `Successfully unfollowed space: ${args.space_id}`
+                    }
+                };
+            } catch (error) {
+                return {
+                    status: "error",
+                    error: error.message
+                };
+            }
+        }
     }
 };
 
@@ -783,6 +1253,8 @@ const tools = {
 class MCPHandler {
     constructor() {
         this.tools = tools;
+        this.snapshotAPI = new SnapshotAPI();
+        this.walletManager = new WalletManager();
     }
 
     async handleRequest(method, params) {
@@ -821,7 +1293,7 @@ class MCPHandler {
                 }
 
                 try {
-                    const result = await tool.handler(args || {});
+                    const result = await tool.handler(args || {}, this.snapshotAPI, this.walletManager);
                     return {
                         content: [{
                             type: "text",

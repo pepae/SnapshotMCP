@@ -9,14 +9,21 @@
     "dev": "nodemon server.js",
     "test": "node test.js"
   },
-  "keywords": ["mcp", "snapshot", "governance", "dao", "voting"],
+  "keywords": [
+    "mcp",
+    "snapshot",
+    "governance",
+    "dao",
+    "voting"
+  ],
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "@snapshot-labs/snapshot.js": "^0.4.78",
-    "ethers": "^6.8.0",
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.3.1"
+    "@snapshot-labs/snapshot.js": "^0.4.110",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.6.1",
+    "ethers": "^5.7.2",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
